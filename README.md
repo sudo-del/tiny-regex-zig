@@ -13,12 +13,15 @@ Inspired by Rob Pike's regex code from [*Beautiful Code*](http://www.cs.princeto
 
 ## Features
 
-- **~350 lines** of straightforward Zig — easy to read, audit, and modify
+- **~400 lines** of straightforward Zig — easy to read, audit, and modify
 - **Zero heap allocations** — all state lives in a fixed-size struct on the stack
 - **No dependencies** — not even libc
 - **Iterative matching** — won't blow the stack on long inputs
+- **`findAll()` iterator** — iterate over all matches without allocating
+- **`slice()` on results** — get the matched text directly, no manual index math
+- **C ABI exports** — use from C, C++, Python ctypes, etc.
 - **Cross-platform** — tested on Linux, macOS, and Windows via CI
-- **75 test vectors** covering edge cases, character classes, and anchoring
+- **80+ tests** covering edge cases, character classes, and anchoring
 
 ## Supported syntax
 
@@ -37,7 +40,7 @@ Inspired by Rob Pike's regex code from [*Beautiful Code*](http://www.cs.princeto
 | `\w` `\W`   | Word character / non-word character             |
 | `\s` `\S`   | Whitespace / non-whitespace                    |
 
-Not supported (yet): capture groups, alternation (`|`), lookahead/behind, unicode.
+Not supported (yet): capture groups, alternation (`|`), backreferences, lookahead/behind, unicode. PRs welcome.
 
 ## Usage
 
@@ -76,21 +79,28 @@ const Regex = @import("tiny-regex").Regex;
 // one-liner: compile + match in a single call
 if (Regex.run("\\d+", "order #4502")) |m| {
     // m.index == 7, m.length == 4
+    // m.slice() returns "4502"
 }
 
 // compile once, match many times
 var re = Regex.compile("[Hh]ello [Ww]orld\\s*[!]?") orelse unreachable;
 
 if (re.match("hello world !")) |m| {
-    std.debug.print("found at {d}, {d} chars\n", .{ m.index, m.length });
+    std.debug.print("found \"{s}\" at {d}\n", .{ m.slice(), m.index });
 }
 
-// returns null on no match — easy to handle
-if (Regex.run("xyz", "abc")) |_| {
-    // won't reach here
-} else {
-    std.debug.print("no match\n", .{});
+// find all matches in a string
+var nums = Regex.compile("\\d+") orelse unreachable;
+var it = nums.findAll("12 apples, 3 oranges, 100 grapes");
+while (it.next()) |m| {
+    std.debug.print("{s}\n", .{ m.slice() }); // prints "12", "3", "100"
 }
+
+// collect into a buffer
+var buf: [16]@import("tiny-regex").MatchResult = undefined;
+var it2 = nums.findAll("a1 b2 c3");
+const n = it2.collect(&buf);
+// n == 3, buf[0..3] contains the matches
 ```
 
 ## Build & test
@@ -114,14 +124,41 @@ pub const Regex = struct {
     /// Compile + match in one call.
     pub fn run(pattern: []const u8, text: []const u8) ?MatchResult
 
+    /// Returns an iterator over all non-overlapping matches in text.
+    pub fn findAll(self: *const Regex, text: []const u8) MatchIterator
+
     /// Dump compiled nodes to stderr (debugging).
     pub fn debugPrint(self: *const Regex) void
 };
 
 pub const MatchResult = struct {
-    index: usize,  // byte offset of the match start
-    length: usize, // number of bytes matched
+    index: usize,          // byte offset of match start
+    length: usize,         // number of bytes matched
+    source: []const u8,    // the original text (for slicing)
+
+    /// returns the matched substring
+    pub fn slice(self: MatchResult) []const u8
 };
+
+pub const MatchIterator = struct {
+    /// returns the next match, or null
+    pub fn next(self: *MatchIterator) ?MatchResult
+
+    /// collect matches into a caller-provided buffer
+    pub fn collect(self: *MatchIterator, buf: []MatchResult) usize
+};
+```
+
+### C ABI
+
+The library also exports C-compatible functions for FFI usage:
+
+```c
+// compile a pattern into caller-provided storage
+bool tiny_re_compile_into(const char *pat, size_t pat_len, tiny_re_t *out);
+
+// match against text. returns byte offset or -1 on no match.
+ssize_t tiny_re_match(const tiny_re_t *re, const char *text, size_t text_len, size_t *out_len);
 ```
 
 ## Contributing

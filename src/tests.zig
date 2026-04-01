@@ -1,5 +1,7 @@
 const std = @import("std");
-const Regex = @import("regex.zig").Regex;
+const regex = @import("regex.zig");
+const Regex = regex.Regex;
+const MatchResult = regex.MatchResult;
 
 const OK = true;
 const NOK = false;
@@ -190,4 +192,63 @@ test "character ranges" {
 
 test "no match returns null" {
     try std.testing.expect(Regex.run("xyz", "abc") == null);
+}
+
+// -- new api tests ---------------------------------------------------------
+
+test "slice returns matched text" {
+    const m = Regex.run("\\d+", "abc 42 def").?;
+    try std.testing.expectEqualStrings("42", m.slice());
+}
+
+test "slice on anchored match" {
+    const m = Regex.run("^hello", "hello world").?;
+    try std.testing.expectEqualStrings("hello", m.slice());
+}
+
+test "findAll basic" {
+    var re = Regex.compile("\\d+") orelse unreachable;
+    var it = re.findAll("foo 12 bar 345 baz 6");
+
+    const m1 = it.next().?;
+    try std.testing.expectEqualStrings("12", m1.slice());
+    try std.testing.expectEqual(@as(usize, 4), m1.index);
+
+    const m2 = it.next().?;
+    try std.testing.expectEqualStrings("345", m2.slice());
+
+    const m3 = it.next().?;
+    try std.testing.expectEqualStrings("6", m3.slice());
+
+    try std.testing.expect(it.next() == null);
+}
+
+test "findAll no matches" {
+    var re = Regex.compile("xyz") orelse unreachable;
+    var it = re.findAll("hello world");
+    try std.testing.expect(it.next() == null);
+}
+
+test "findAll collect" {
+    var re = Regex.compile("[a-z]+") orelse unreachable;
+    var it = re.findAll("foo BAR baz QUUX hello");
+    var buf: [10]MatchResult = undefined;
+    const n = it.collect(&buf);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("foo", buf[0].slice());
+    try std.testing.expectEqualStrings("baz", buf[1].slice());
+    try std.testing.expectEqualStrings("hello", buf[2].slice());
+}
+
+test "findAll with dot-star doesn't infinite loop" {
+    // .* can match zero chars; make sure the iterator advances
+    var re = Regex.compile("a*") orelse unreachable;
+    var it = re.findAll("bab");
+    var count: usize = 0;
+    while (it.next()) |_| {
+        count += 1;
+        if (count > 20) break; // safety net
+    }
+    // should terminate reasonably
+    try std.testing.expect(count <= 10);
 }

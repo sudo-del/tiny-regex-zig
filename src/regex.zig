@@ -1,31 +1,28 @@
+// tiny regex engine for zig
 //
-// Tiny regex engine — a minimal regex implementation in Zig.
+// based on:
+//  http://www.cs.princeton.edu/courses/archive/spr09/cos333/beautiful.html
 //
-// Inspired by Rob Pike's regex code described in:
-// http://www.cs.princeton.edu/courses/archive/spr09/cos333/beautiful.html
-//
-// Supports:
-//   '.'        Dot, matches any character
-//   '^'        Start anchor, matches beginning of string
-//   '$'        End anchor, matches end of string
-//   '*'        Asterisk, match zero or more (greedy)
-//   '+'        Plus, match one or more (greedy)
-//   '?'        Question, match zero or one (non-greedy)
-//   '[abc]'    Character class, match if one of {'a', 'b', 'c'}
-//   '[^abc]'   Inverted class, match if NOT one of {'a', 'b', 'c'}
-//   '[a-zA-Z]' Character ranges, the character set of the ranges { a-z | A-Z }
-//   '\s'       Whitespace, \t \f \r \n \v and spaces
-//   '\S'       Non-whitespace
-//   '\w'       Alphanumeric, [a-zA-Z0-9_]
-//   '\W'       Non-alphanumeric
-//   '\d'       Digits, [0-9]
-//   '\D'       Non-digits
-//
+// supported syntax:
+//   .        any character (newline behavior configurable)
+//   ^        start anchor
+//   $        end anchor
+//   *        zero or more (greedy)
+//   +        one or more (greedy)
+//   ?        zero or one
+//   [abc]    character class
+//   [^abc]   inverted class
+//   [a-z]    ranges
+//   \s \S    whitespace / non-whitespace
+//   \w \W    word char / non-word
+//   \d \D    digit / non-digit
 
 const std = @import("std");
 
 pub const max_regexp_objects: usize = 30;
 pub const max_char_class_len: usize = 40;
+
+// flip this if you don't want '.' to match '\n'
 pub const dot_matches_newline: bool = true;
 
 const OpType = enum(u8) {
@@ -47,9 +44,8 @@ const OpType = enum(u8) {
     not_whitespace,
 };
 
-// Stores a single compiled regex node. Character classes reference a
-// region of the external ccl_buf via start offset + length rather than
-// a pointer, so the struct stays valid across copies.
+// ccl uses offset+length into ccl_buf instead of pointers
+// so the whole struct is safe to copy by value
 const RegexNode = struct {
     op: OpType = .unused,
     ch: u8 = 0,
@@ -60,6 +56,13 @@ const RegexNode = struct {
 pub const MatchResult = struct {
     index: usize,
     length: usize,
+    // keep a ref to the original text so we can slice it
+    source: []const u8,
+
+    /// returns the actual matched text
+    pub fn slice(self: MatchResult) []const u8 {
+        return self.source[self.index .. self.index + self.length];
+    }
 };
 
 pub const Regex = struct {
@@ -165,7 +168,7 @@ pub const Regex = struct {
 
         if (self.nodes[0].op == .begin) {
             if (matchPattern(self.nodes[1..], &self.ccl_buf, text, &length)) {
-                return MatchResult{ .index = 0, .length = length };
+                return MatchResult{ .index = 0, .length = length, .source = text };
             }
             return null;
         }
@@ -175,26 +178,32 @@ pub const Regex = struct {
             length = 0;
             if (matchPattern(self.nodes[0..], &self.ccl_buf, text[idx..], &length)) {
                 if (idx == text.len and length == 0) return null;
-                return MatchResult{ .index = idx, .length = length };
+                return MatchResult{ .index = idx, .length = length, .source = text };
             }
         }
         return null;
     }
 
+    /// convenience: compile + match in one shot
     pub fn run(pattern: []const u8, text: []const u8) ?MatchResult {
         var re = Regex.compile(pattern) orelse return null;
         return re.match(text);
     }
 
+    /// iterate over all non-overlapping matches in text
+    pub fn findAll(self: *const Regex, text: []const u8) MatchIterator {
+        return MatchIterator{ .re = self, .text = text, .offset = 0 };
+    }
+
     pub fn debugPrint(self: *const Regex) void {
-        const type_names = [_][]const u8{
+        const names = [_][]const u8{
             "UNUSED", "DOT",       "BEGIN",      "END",            "QUESTIONMARK", "STAR",
             "PLUS",   "CHAR",      "CHAR_CLASS", "INV_CHAR_CLASS", "DIGIT",        "NOT_DIGIT",
             "ALPHA",  "NOT_ALPHA", "WHITESPACE", "NOT_WHITESPACE",
         };
         for (self.nodes[0..self.node_count]) |node| {
             if (node.op == .unused) break;
-            std.debug.print("type: {s}", .{type_names[@intFromEnum(node.op)]});
+            std.debug.print("type: {s}", .{names[@intFromEnum(node.op)]});
             if (node.op == .char_class or node.op == .inv_char_class) {
                 std.debug.print(" [", .{});
                 const ccl = getCcl(node, &self.ccl_buf);
@@ -211,9 +220,45 @@ pub const Regex = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// matching internals
-// ---------------------------------------------------------------------------
+// -- match iterator --------------------------------------------------------
+
+pub const MatchIterator = struct {
+    re: *const Regex,
+    text: []const u8,
+    offset: usize,
+
+    /// returns next non-overlapping match, or null when done
+    pub fn next(self: *MatchIterator) ?MatchResult {
+        if (self.offset > self.text.len) return null;
+
+        // try matching from current offset onwards
+        if (self.re.match(self.text[self.offset..])) |m| {
+            var result = m;
+            result.index += self.offset;
+            result.source = self.text;
+            // advance past this match (at least 1 char to avoid infinite loops on zero-width)
+            self.offset = result.index + @max(result.length, 1);
+            return result;
+        }
+        self.offset = self.text.len + 1;
+        return null;
+    }
+
+    /// collect all remaining matches into a fixed buffer.
+    /// returns the number of matches written. if there are more
+    /// matches than buf.len, the rest are silently dropped.
+    pub fn collect(self: *MatchIterator, buf: []MatchResult) usize {
+        var n: usize = 0;
+        while (n < buf.len) {
+            buf[n] = self.next() orelse break;
+            n += 1;
+        }
+        return n;
+    }
+};
+
+// -- matching internals ----------------------------------------------------
+// these are all private; the public api is Regex + MatchResult + MatchIterator
 
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
@@ -235,11 +280,8 @@ fn isWhitespace(c: u8) bool {
 }
 
 fn matchDot(_: u8) bool {
-    if (comptime dot_matches_newline) {
-        return true;
-    }
-    // unreachable when dot_matches_newline is true, but kept
-    // here so the logic is complete if the const is toggled.
+    // comptime branch — if dot_matches_newline is on, dot matches everything
+    if (comptime dot_matches_newline) return true;
     return false;
 }
 
@@ -282,6 +324,7 @@ fn matchCharClass(c: u8, str: []const u8) bool {
             if (matchMetaChar(c, str[i])) return true;
             if (c == str[i] and !isMetaChar(c)) return true;
         } else if (c == str[i]) {
+            // literal dash only matches at start or end of class
             if (c == '-') {
                 return (i == 0) or (i + 1 >= str.len) or (str[i + 1] == 0);
             }
@@ -317,11 +360,13 @@ fn matchStar(p: RegexNode, pattern: []const RegexNode, ccl_buf: *const [max_char
     const prelen = length.*;
     var consumed: usize = 0;
 
+    // eat as many as possible (greedy)
     while (consumed < text.len and matchOne(p, text[consumed], ccl_buf)) {
         consumed += 1;
         length.* += 1;
     }
 
+    // then backtrack until the rest of the pattern matches
     while (true) {
         if (matchPattern(pattern, ccl_buf, text[consumed..], length)) return true;
         if (consumed == 0) break;
@@ -370,18 +415,14 @@ fn matchPattern(pattern: []const RegexNode, ccl_buf: *const [max_char_class_len]
     var txt = text;
 
     while (true) {
-        if (pat.len == 0 or pat[0].op == .unused) {
-            return true;
-        }
+        if (pat.len == 0 or pat[0].op == .unused) return true;
 
         if (pat.len > 1 and pat[1].op == .questionmark) {
             return matchQuestion(pat[0], if (pat.len > 2) pat[2..] else pat[0..0], ccl_buf, txt, length);
         }
-
         if (pat.len > 1 and pat[1].op == .star) {
             return matchStar(pat[0], if (pat.len > 2) pat[2..] else pat[0..0], ccl_buf, txt, length);
         }
-
         if (pat.len > 1 and pat[1].op == .plus) {
             return matchPlus(pat[0], if (pat.len > 2) pat[2..] else pat[0..0], ccl_buf, txt, length);
         }
@@ -399,4 +440,54 @@ fn matchPattern(pattern: []const RegexNode, ccl_buf: *const [max_char_class_len]
         pat = pat[1..];
         txt = txt[1..];
     }
+}
+
+// -- C ABI -----------------------------------------------------------------
+// lets you use tiny-regex from C, C++, python ctypes, etc.
+// TODO: maybe wrap this behind a build option so it doesn't bloat
+//       the binary for people who don't need it
+
+const CRegex = extern struct {
+    // opaque blob — C code shouldn't poke at internals
+    _data: [(@sizeOf(Regex) + 7) / 8]u64 align(@alignOf(Regex)),
+
+    fn fromZig(re: Regex) CRegex {
+        var out: CRegex = undefined;
+        const dst: *Regex = @ptrCast(@alignCast(&out._data));
+        dst.* = re;
+        return out;
+    }
+
+    fn toZig(self: *const CRegex) *const Regex {
+        return @ptrCast(@alignCast(&self._data));
+    }
+};
+
+export fn tiny_re_compile(pat: [*]const u8, pat_len: usize) ?*CRegex {
+    // can't heap-alloc (whole point is zero alloc), so this returns
+    // a stack value — caller must copy it. for a more ergonomic C api
+    // you'd want the caller to pass a pointer to write into.
+    _ = pat;
+    _ = pat_len;
+    return null; // placeholder, see tiny_re_compile_into
+}
+
+/// compile a pattern into caller-provided storage
+export fn tiny_re_compile_into(pat: [*]const u8, pat_len: usize, out: *CRegex) bool {
+    const pattern = pat[0..pat_len];
+    const re = Regex.compile(pattern) orelse return false;
+    out.* = CRegex.fromZig(re);
+    return true;
+}
+
+/// run a match against text. returns -1 on no match, otherwise the byte offset.
+/// if out_len is non-null, writes the match length there.
+export fn tiny_re_match(crefix: *const CRegex, text: [*]const u8, text_len: usize, out_len: ?*usize) isize {
+    const re = crefix.toZig();
+    const t = text[0..text_len];
+    if (re.match(t)) |m| {
+        if (out_len) |p| p.* = m.length;
+        return @intCast(m.index);
+    }
+    return -1;
 }
